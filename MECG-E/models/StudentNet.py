@@ -30,6 +30,89 @@ def get_padding_2d(kernel_size, dilation=(1, 1)):
             int((kernel_size[1]*dilation[1] - dilation[1])/2))
 
 
+# ══════════════════════════════════════════════════════════
+# Causal building blocks（config: model.causal = True 時才會被使用）
+#   張量佈局：[B, C, T, F]，T = 時間 frame 軸，F = 頻率軸
+#   原版非因果的來源有兩種：
+#     1) 時間軸卷積用「對稱 padding」→ 輸出會看到未來 frame
+#     2) GroupNorm / InstanceNorm 的統計量跨整個 T → 每一幀都被未來 frame 影響
+#   因果版：時間軸只在「過去」那側補 0；norm 改成「逐幀」計算統計量。
+# ══════════════════════════════════════════════════════════
+class CausalGroupNorm2d(nn.Module):
+    """逐幀 GroupNorm：對每個 time step，只在 (組內 channel × F) 上算 mean/var，
+    不跨 T，所以輸出完全不依賴其他 frame。num_groups == C 時等價於「逐幀 InstanceNorm」。"""
+    def __init__(self, num_groups, num_channels, eps=1e-5, affine=True):
+        super().__init__()
+        assert num_channels % num_groups == 0, (num_channels, num_groups)
+        self.g, self.c, self.eps, self.affine = num_groups, num_channels, eps, affine
+        if affine:
+            self.weight = nn.Parameter(torch.ones(1, num_channels, 1, 1))
+            self.bias = nn.Parameter(torch.zeros(1, num_channels, 1, 1))
+
+    def forward(self, x):                                   # x: [B, C, T, F]
+        B, C, T, Fq = x.shape
+        xg = x.reshape(B, self.g, C // self.g, T, Fq)
+        mean = xg.mean(dim=(2, 4), keepdim=True)            # 沿 (組內 channel, F)，不含 T
+        var = xg.var(dim=(2, 4), keepdim=True, unbiased=False)
+        xg = (xg - mean) / torch.sqrt(var + self.eps)
+        x = xg.reshape(B, C, T, Fq)
+        if self.affine:
+            x = x * self.weight + self.bias
+        return x
+
+
+class ChannelGroupNorm1d(nn.Module):
+    """逐位置 GroupNorm：x: [B, C, L]，每個位置 l 只在 channel 維度上標準化，不跨 L。
+    用在時間軸卷積之後（L = T），groups=1 即逐幀 channel LayerNorm。"""
+    def __init__(self, num_groups, num_channels, eps=1e-5):
+        super().__init__()
+        assert num_channels % num_groups == 0, (num_channels, num_groups)
+        self.g, self.c, self.eps = num_groups, num_channels, eps
+        self.weight = nn.Parameter(torch.ones(1, num_channels, 1))
+        self.bias = nn.Parameter(torch.zeros(1, num_channels, 1))
+
+    def forward(self, x):                                   # x: [B, C, L]
+        B, C, L = x.shape
+        xg = x.reshape(B, self.g, C // self.g, L)
+        mean = xg.mean(dim=2, keepdim=True)
+        var = xg.var(dim=2, keepdim=True, unbiased=False)
+        xg = (xg - mean) / torch.sqrt(var + self.eps)
+        return xg.reshape(B, C, L) * self.weight + self.bias
+
+
+class _TimeCausalConv2d(nn.Module):
+    """Conv2d：時間軸（dim=2）只在過去補 (k_t-1)*dil_t 個 0、不補未來；頻率軸維持對稱 padding。"""
+    def __init__(self, in_ch, out_ch, kernel_size, dil_t):
+        super().__init__()
+        self.pad_t = (kernel_size[0] - 1) * dil_t
+        pad_f = (kernel_size[1] - 1) // 2
+        self.conv = nn.Conv2d(in_ch, out_ch, kernel_size, dilation=(dil_t, 1), padding=(0, pad_f))
+
+    def forward(self, x):                                   # x: [B, C, T, F]
+        x = F.pad(x, (0, 0, self.pad_t, 0))                 # (F_left, F_right, T_top(過去), T_bottom(未來))
+        return self.conv(x)
+
+
+def _is_causal(h):
+    return bool(h.get('causal', False))
+
+
+def _gn_or_in_2d(h, C):
+    """原版：use_gn → GroupNorm，否則 InstanceNorm2d；causal 時換成逐幀版本。"""
+    use_gn = h.get('use_gn', False)
+    if _is_causal(h):
+        return CausalGroupNorm2d(h.get('gn_groups', 8) if use_gn else C, C)
+    return (nn.GroupNorm(h.get('gn_groups', 8), C, affine=True) if use_gn
+            else nn.InstanceNorm2d(C, affine=True))
+
+
+def _in_2d(h, C):
+    """原版 decoder 一律 InstanceNorm2d；causal 時換成逐幀 InstanceNorm。"""
+    if _is_causal(h):
+        return CausalGroupNorm2d(C, C)
+    return nn.InstanceNorm2d(C, affine=True)
+
+
 class _LearnableSigmoidBase(nn.Module):
     def __init__(self, in_features: int, beta: float = 1.0, min_slope: float = 0.05):
         super().__init__()
@@ -115,11 +198,14 @@ class DenseBlock(nn.Module):
         self.dense_block = nn.ModuleList([])
         for i in range(depth):
             dil = 2 ** i
+            if _is_causal(h):
+                conv = _TimeCausalConv2d(h['dense_channel']*(i+1), h['dense_channel'], kernel_size, dil)
+            else:
+                conv = nn.Conv2d(h['dense_channel']*(i+1), h['dense_channel'], kernel_size,
+                                 dilation=(dil, 1), padding=get_padding_2d(kernel_size, (dil, 1)))
             dense_conv = nn.Sequential(
-                nn.Conv2d(h['dense_channel']*(i+1), h['dense_channel'], kernel_size,
-                          dilation=(dil, 1), padding=get_padding_2d(kernel_size, (dil, 1))),
-                (nn.GroupNorm(h.get('gn_groups', 8), h['dense_channel'], affine=True)
-                 if h.get('use_gn', False) else nn.InstanceNorm2d(h['dense_channel'], affine=True)),
+                conv,
+                _gn_or_in_2d(h, h['dense_channel']),
                 nn.PReLU(h['dense_channel'])
             )
             self.dense_block.append(dense_conv)
@@ -135,14 +221,12 @@ class DenseBlock(nn.Module):
 class DenseEncoder(nn.Module):
     def __init__(self, h, in_channel):
         super().__init__()
-        gn_or_in = (nn.GroupNorm(h.get('gn_groups', 8), h['dense_channel'], affine=True)
-                    if h.get('use_gn', False) else nn.InstanceNorm2d(h['dense_channel'], affine=True))
+        gn_or_in = _gn_or_in_2d(h, h['dense_channel'])
         self.dense_conv_1 = nn.Sequential(
             nn.Conv2d(in_channel, h['dense_channel'], (1, 1)), gn_or_in, nn.PReLU(h['dense_channel'])
         )
         self.dense_block = DenseBlock(h, depth=h.get('edepth', 4))
-        gn_or_in2 = (nn.GroupNorm(h.get('gn_groups', 8), h['dense_channel'], affine=True)
-                    if h.get('use_gn', False) else nn.InstanceNorm2d(h['dense_channel'], affine=True))
+        gn_or_in2 = _gn_or_in_2d(h, h['dense_channel'])
         self.dense_conv_2 = nn.Sequential(
             nn.Conv2d(h['dense_channel'], h['dense_channel'], (1, 3), (1, 2)),
             gn_or_in2, nn.PReLU(h['dense_channel'])
@@ -162,7 +246,7 @@ class MaskDecoder(nn.Module):
         self.mask_conv = nn.Sequential(
             nn.ConvTranspose2d(h['dense_channel'], h['dense_channel'], (1, 3), (1, 2)),
             nn.Conv2d(h['dense_channel'], out_channel, (1, 1)),
-            nn.InstanceNorm2d(out_channel, affine=True),
+            _in_2d(h, out_channel),
             nn.PReLU(out_channel),
             nn.Conv2d(out_channel, out_channel, (1, 1))
         )
@@ -201,7 +285,7 @@ class PhaseDecoder(nn.Module):
         self.dense_block = DenseBlock(h, depth=h.get('pdepth', 4))
         self.phase_conv = nn.Sequential(
             nn.ConvTranspose2d(h['dense_channel'], h['dense_channel'], (1, 3), (1, 2)),
-            nn.InstanceNorm2d(h['dense_channel'], affine=True), nn.PReLU(h['dense_channel'])
+            _in_2d(h, h['dense_channel']), nn.PReLU(h['dense_channel'])
         )
         self.phase_conv_r = nn.Conv2d(h['dense_channel'], out_channel, (1, 1))
         self.phase_conv_i = nn.Conv2d(h['dense_channel'], out_channel, (1, 1))
@@ -218,7 +302,7 @@ class ComplexDecoder(nn.Module):
         self.dense_block = DenseBlock(h, depth=h.get('pdepth', 4))
         self.phase_conv = nn.Sequential(
             nn.ConvTranspose2d(h['dense_channel'], h['dense_channel'], (1, 3), (1, 2)),
-            nn.InstanceNorm2d(h['dense_channel'], affine=True), nn.PReLU(h['dense_channel'])
+            _in_2d(h, h['dense_channel']), nn.PReLU(h['dense_channel'])
         )
         self.phase_conv_r = nn.Conv2d(h['dense_channel'], out_channel, (1, 1))
         self.phase_conv_i = nn.Conv2d(h['dense_channel'], out_channel, (1, 1))
@@ -235,16 +319,26 @@ class ComplexDecoder(nn.Module):
 # ══════════════════════════════════════════════════════════
 class DepthwiseSeparableConv1d(nn.Module):
     """分組卷積（depthwise）+ 1x1 卷積（pointwise），ULde-net 的核心壓縮技巧。"""
-    def __init__(self, channels, kernel_size=5, dilation=1):
+    def __init__(self, channels, kernel_size=5, dilation=1, causal_time=False, causal_gn_groups=1):
         super().__init__()
-        padding = get_padding(kernel_size, dilation)
-        self.depthwise = nn.Conv1d(channels, channels, kernel_size, padding=padding,
-                                    dilation=dilation, groups=channels)   # groups=channels → depthwise
+        self.causal_time = causal_time
+        if causal_time:
+            # L 是時間軸：只在過去補 (k-1)*dil 個 0；norm 逐位置只對 channel 標準化（不跨 L）
+            self.left_pad = (kernel_size - 1) * dilation
+            self.depthwise = nn.Conv1d(channels, channels, kernel_size, padding=0,
+                                        dilation=dilation, groups=channels)
+            self.norm = ChannelGroupNorm1d(causal_gn_groups, channels)
+        else:
+            padding = get_padding(kernel_size, dilation)
+            self.depthwise = nn.Conv1d(channels, channels, kernel_size, padding=padding,
+                                        dilation=dilation, groups=channels)   # groups=channels → depthwise
+            self.norm = nn.GroupNorm(min(8, channels), channels)
         self.pointwise = nn.Conv1d(channels, channels, 1)
-        self.norm = nn.GroupNorm(min(8, channels), channels)
         self.act = nn.PReLU(channels)
 
     def forward(self, x):          # x: [B, C, L]
+        if self.causal_time:
+            x = F.pad(x, (self.left_pad, 0))
         x = self.depthwise(x)
         x = self.pointwise(x)
         x = self.norm(x)
@@ -262,8 +356,12 @@ class TFConvBlock(nn.Module):
     def __init__(self, h):
         super().__init__()
         C = h['dense_channel']
-        self.time_conv1 = DepthwiseSeparableConv1d(C, kernel_size=5, dilation=1)
-        self.time_conv2 = DepthwiseSeparableConv1d(C, kernel_size=5, dilation=4)
+        causal = _is_causal(h)
+        gn_t = int(h.get('causal_time_gn_groups', 1))
+        self.time_conv1 = DepthwiseSeparableConv1d(C, kernel_size=5, dilation=1,
+                                                   causal_time=causal, causal_gn_groups=gn_t)
+        self.time_conv2 = DepthwiseSeparableConv1d(C, kernel_size=5, dilation=4,
+                                                   causal_time=causal, causal_gn_groups=gn_t)
         self.use_fconv = h.get('fmamba', True)   # 沿用同名 config key，語意上代表「頻率軸也建模」
         if self.use_fconv:
             self.freq_conv = DepthwiseSeparableConv1d(C, kernel_size=5, dilation=1)
@@ -308,6 +406,7 @@ class StudentSSEMGNet(nn.Module):
         self.norm = h.get('norm', False)
         self.loss_fn = h['loss_fn'].split('+') if isinstance(h['loss_fn'], str) else list(h['loss_fn'])
         self.num_tscblocks = h['num_tscblocks']
+        self.causal = _is_causal(h)
 
         self.dense_encoder = DenseEncoder(h, in_channel=2)
         self.TFConv = nn.ModuleList([TFConvBlock(h) for _ in range(h['num_tscblocks'])])
@@ -339,7 +438,8 @@ class StudentSSEMGNet(nn.Module):
             x_input = x_noisy
         elif self.fea == 'pha':
             ch0, ch1 = x_noisy[:, 0], x_noisy[:, 1]
-            need_convert = ((ch0 < 0).float().mean() > 0.05) or (ch1.abs().max() > 3.6)
+            # causal 模式：輸入固定視為 (mag, pha)，不用整段/整個 batch 的統計量判斷格式（避免把未來資訊帶進來）
+            need_convert = False if self.causal else (((ch0 < 0).float().mean() > 0.05) or (ch1.abs().max() > 3.6))
             if need_convert:
                 noisy_real_TF, noisy_imag_TF = ch0, ch1
                 mag_TF = torch.sqrt(noisy_real_TF**2 + noisy_imag_TF**2 + 1e-12)
