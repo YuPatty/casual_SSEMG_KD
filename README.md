@@ -371,6 +371,32 @@ subject/exercise/channel coverage matches `prepare_data.py`'s intended split
 (train = subjects 11–40 / exercise 1; valid/test = subjects 1–10 / exercise
 3 and 2 respectively).
 
+## Causal student (streaming-oriented variant)
+
+`config/student_16ch_1blk_causal.yaml` is the same student with `model.causal: True`.
+With the flag on, `models/StudentNet.py` switches to:
+
+- time-axis convolutions (DenseBlock, TF-ConvBlock temporal DS-Conv) that pad **only the past** side;
+- per-frame normalisation (`CausalGroupNorm2d`, `ChannelGroupNorm1d`) instead of GroupNorm/InstanceNorm
+  statistics that span the whole time axis;
+- no batch-wide input-format sniffing in `forward_spectrogram`.
+
+With the flag off (default) the network is exactly the original, and old checkpoints still load.
+A causal student has different layers/statistics, so it **must be trained from scratch** (KD from the
+non-causal teacher works unchanged because the STFT frame grid is not modified):
+
+    python pipeline_distill_crossarch_v5.py --student_config config/student_16ch_1blk_causal.yaml ...
+
+Verify causality (future frames must not change past outputs):
+
+    python test_causality.py --config config/student_16ch_1blk_causal.yaml   # expect ✔
+    python test_causality.py --config config/student_16ch_1blk.yaml          # expect ✘ (original is non-causal)
+
+**Not yet causal end-to-end:** the STFT front end (`center=True` reflect padding looks ~win/2 ahead) and the
+iSTFT overlap-add (needs up to `win_size` samples of look-ahead; 512 ms at 1 kHz with `win_size=512`) still
+have look-ahead. Only the *network* is causal. A streaming front end (left-padded `center=False` STFT,
+shorter synthesis window / smaller `win_size`) is the next step and requires retraining the teacher on the same grid.
+
 ## Installation
 
 SSEMG-Net uses the official `mamba-ssm` package and does not vendor a separate
