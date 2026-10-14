@@ -1,4 +1,5 @@
-import os, re, sys, csv, subprocess, torch, math
+import os, re, sys, csv, subprocess, torch, math, random
+import numpy as np
 from contextlib import nullcontext
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
@@ -11,7 +12,7 @@ def _autocast_ctx(device):            # 依舊包一層，之後呼叫不用改
 # ── 讓 MECGE 可以 import ───────────────────────────
 ROOT_DIR = os.path.dirname(__file__)
 sys.path.insert(0, os.path.join(ROOT_DIR, 'MECG-E'))
-# from models.SSEMGNet import SSEMGNet           # noqa: E402
+from models.SSEMGNet import SSEMGNet           # noqa: E402
 from spectrogram_dataset import OnTheFlySpectrogramDataset
 
 # ═══════════════════════════════════════════════════
@@ -134,7 +135,52 @@ def _batch_mf_err(wav_pred: torch.Tensor, wav_clean: torch.Tensor, metrics_cfg: 
     return (mf_p - mf_c).abs().mean().item()
 
 # ═══════════════════════════════════════════════════
-def run_training(cfg, data_root):
+# resume / checkpoint helpers
+# ═══════════════════════════════════════════════════
+def _atomic_save(obj, path):
+    """先寫 .tmp 再 os.replace，避免被 kill 時留下半個壞檔。"""
+    tmp = path + '.tmp'
+    torch.save(obj, tmp)
+    os.replace(tmp, path)
+
+def _rng_state():
+    return {
+        'py': random.getstate(),
+        'np': np.random.get_state(),
+        'torch': torch.get_rng_state(),
+        'cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+
+def _set_rng_state(s):
+    random.setstate(s['py'])
+    np.random.set_state(s['np'])
+    torch.set_rng_state(s['torch'].cpu())
+    try:
+        if s.get('cuda') is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all([x.cpu() for x in s['cuda']])
+    except Exception as e:                  # GPU 數量不同等情況，不影響續訓
+        print(f"[resume] skip CUDA RNG restore ({e})")
+
+def _read_log(log_csv):
+    if not os.path.exists(log_csv):
+        return []
+    with open(log_csv, newline='') as f:
+        return list(csv.DictReader(f))
+
+def _trim_log(log_csv, last_ep):
+    """只保留 epoch <= last_ep 的列（避免「log 寫了但 ckpt 沒存到」造成重複 epoch）。"""
+    if not os.path.exists(log_csv):
+        return
+    with open(log_csv, newline='') as f:
+        rows = list(csv.reader(f))
+    if not rows:
+        return
+    keep = [rows[0]] + [r for r in rows[1:] if r and int(r[0]) <= last_ep]
+    with open(log_csv, 'w', newline='') as f:
+        csv.writer(f).writerows(keep)
+
+# ═══════════════════════════════════════════════════
+def run_training(cfg, data_root, resume=None):
     # ── 讀取 batch/epochs/accum/amp ─────────────────
     BATCH = int(cfg.get('train', {}).get('batch_size', 8))
     EPOCHS = int(cfg.get('train', {}).get('epochs', 100))
@@ -215,13 +261,15 @@ def run_training(cfg, data_root):
     os.makedirs(log_dir, exist_ok=True)
     log_csv = os.path.join(log_dir, 'train_log.csv')
 
-    with open(log_csv, 'w', newline='') as f:
-        csv.writer(f).writerow([
-            'epoch','train_loss','val_loss',
-            'tr_time','tr_com','tr_con','tr_mr','tr_H',
-            'va_time','va_com','va_con','va_mr','va_H',
-            'val_mf','lsigmoid_slope'
-        ])
+    # resume 時不能用 'w' 覆蓋舊 log（舊 log 也是 legacy 續訓時還原狀態的來源）
+    if not (resume and os.path.exists(log_csv)):
+        with open(log_csv, 'w', newline='') as f:
+            csv.writer(f).writerow([
+                'epoch','train_loss','val_loss',
+                'tr_time','tr_com','tr_con','tr_mr','tr_H',
+                'va_time','va_com','va_con','va_mr','va_H',
+                'val_mf','lsigmoid_slope'
+            ])
     print(f"[log] writing logs to {log_csv}")
 
     no_improve_epochs  = 0        # ← 新增：連續沒進步的計數
@@ -234,13 +282,71 @@ def run_training(cfg, data_root):
     best_by_mf_path = model_save.replace('_weights.pth', '_best_by_mf.pth')
     dbg_every = int(cfg.get('train', {}).get('dbg_every', 5000))
 
+    last_path = model_save.replace('_weights.pth', '_last.pth')   # 純權重（給推論用）
+    ckpt_path = model_save.replace('_weights.pth', '_ckpt.pth')   # 完整狀態（給 --resume 用）
+
+    # ── Resume ───────────────────────────────────────
+    start_ep = 1
+    if resume:
+        if resume == 'auto':
+            path = ckpt_path if os.path.exists(ckpt_path) else (
+                   last_path if os.path.exists(last_path) else None)
+        else:
+            path = resume
+        if path is None or not os.path.exists(path):
+            print(f"[resume] 找不到 checkpoint（{path or ckpt_path}），從頭開始")
+        else:
+            ck = torch.load(path, map_location=device, weights_only=False)
+            if isinstance(ck, dict) and 'optim' in ck and 'model' in ck:
+                # 完整 checkpoint
+                model.load_state_dict(ck['model'])
+                optim.load_state_dict(ck['optim'])
+                scheduler.load_state_dict(ck['sched'])
+                best_val = ck['best_val']
+                best_mf = ck['best_mf']
+                no_improve_epochs = ck['no_improve_epochs']
+                _set_rng_state(ck['rng'])
+                start_ep = ck['epoch'] + 1
+                print(f"[resume] {path} → 從 epoch {start_ep} 繼續 "
+                      f"(best_val={best_val:.4f}, lr={optim.param_groups[0]['lr']:.2e})")
+            else:
+                # 舊格式：只有權重。optimizer 動量無法還原，但 epoch / best / patience / lr
+                # 可以靠 train_log.csv 重播 scheduler 還原。
+                model.load_state_dict(ck)
+                rows = _read_log(log_csv)
+                if not rows:
+                    print(f"[resume] {path} 是純權重且沒有 train_log.csv 可還原進度 → "
+                          f"只載入權重，epoch 從 1 開始")
+                else:
+                    for r in rows:
+                        v = float(r['val_loss']); m = float(r['val_mf'])
+                        if v < best_val:
+                            best_val, no_improve_epochs = v, 0
+                        else:
+                            no_improve_epochs += 1
+                        if not math.isnan(m) and m < best_mf:
+                            best_mf = m
+                        scheduler.step(v)
+                    start_ep = int(rows[-1]['epoch']) + 1
+                    print(f"[resume] 純權重 {path} + train_log.csv → 從 epoch {start_ep} 繼續 "
+                          f"(best_val={best_val:.4f}, lr={optim.param_groups[0]['lr']:.2e}；"
+                          f"AdamW 動量從零開始)")
+            _trim_log(log_csv, start_ep - 1)
+
+    if no_improve_epochs >= PATIENCE:
+        print(f"⏹ 已達 early stopping 條件（{no_improve_epochs}/{PATIENCE}），不需再訓練。")
+        return
+    if start_ep > EPOCHS:
+        print(f"⏹ start_ep={start_ep} > EPOCHS={EPOCHS}，訓練已完成。")
+        return
+
     # 額外列印基本資訊（方便核對）
     print(f"Train set: N={len(train_ds)}")
     print(f"Valid set: N={len(valid_ds)}")
     print(f"Steps/epoch: {len(train_loader)} (batch={BATCH}, drop_last=True)")
 
     # ════════════ Epoch loop ════════════
-    for ep in range(1, EPOCHS + 1):
+    for ep in range(start_ep, EPOCHS + 1):
         
         # ===== train =========================================================
         model.train()
@@ -415,7 +521,7 @@ def run_training(cfg, data_root):
         if val_loss < best_val:
             best_val = val_loss
             no_improve_epochs = 0
-            torch.save(model.state_dict(), model_save)
+            _atomic_save(model.state_dict(), model_save)
             print(f"✓ new best (val={best_val:.4f}) saved to {model_save}")
         else:
             no_improve_epochs += 1
@@ -424,7 +530,7 @@ def run_training(cfg, data_root):
         # ---- best by MF ------------------------------------------------------
         if not math.isnan(val_mf) and val_mf < best_mf:
             best_mf = val_mf
-            torch.save(model.state_dict(), best_by_mf_path)
+            _atomic_save(model.state_dict(), best_by_mf_path)
             print(f"✓ new best MF (val_mf={best_mf:.4f} Hz) saved to {best_by_mf_path}")
 
         prev_lr = optim.param_groups[0]['lr']
@@ -435,9 +541,18 @@ def run_training(cfg, data_root):
         else:
             print(f" >>> lr stays : {new_lr:.2e}")
 
-        # 每個 epoch 都覆蓋一份 "last"
-        last_path = model_save.replace('_weights.pth', '_last.pth')
-        torch.save(model.state_dict(), last_path)
+        # 每個 epoch 都覆蓋一份 "last"（純權重）+ 完整 checkpoint（可 --resume）
+        _atomic_save(model.state_dict(), last_path)
+        _atomic_save({
+            'model': model.state_dict(),
+            'optim': optim.state_dict(),
+            'sched': scheduler.state_dict(),
+            'epoch': ep,                         # 已完成的 epoch
+            'best_val': best_val,
+            'best_mf': best_mf,
+            'no_improve_epochs': no_improve_epochs,
+            'rng': _rng_state(),
+        }, ckpt_path)
 
         if no_improve_epochs >= PATIENCE:
             print(f"⏹ Early stopping: val_loss did not improve for {PATIENCE} consecutive epochs.")
@@ -452,7 +567,20 @@ if __name__ == '__main__':
                    help='waveform data_root（prepare_data.py 的輸出，內含 '
                         'train/valid/{noisy,clean}/*.npy）；不再需要先跑 '
                         'convert.py / make_dataset_spectrogram.py 產生 .pt 快取')
+    p.add_argument('--suffix', default='',
+                   help='append to exp name (checkpoints + log dir), e.g. _v2')
+    p.add_argument('--resume', nargs='?', const='auto', default=None,
+                   help='從上次中斷處繼續。不帶值＝自動找 model_weight/<exp>_ckpt.pth '
+                        '(找不到就退回 _last.pth + train_log.csv)；也可指定 checkpoint 路徑。'
+                        '記得 --config / --suffix 要跟上次一致。')
     args = p.parse_args()
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
-    run_training(cfg, args.data_root)
+
+    if args.suffix:
+        old = (cfg.get('exp') or {}).get('name') or cfg.get('experiment') or 'exp'
+        cfg['exp'] = cfg.get('exp') or {}
+        cfg['exp']['name'] = f"{old}{args.suffix}"
+        print(f"[exp] name -> {cfg['exp']['name']}")
+
+    run_training(cfg, args.data_root, resume=args.resume)
