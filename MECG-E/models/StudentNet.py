@@ -546,3 +546,4 @@ class StudentSSEMGNet(nn.Module):
         self.last_outputs = {"mask": mask_out, "mag_g_FT": mag_g_FT, "pha_g": pha_g, "com_g": com_g}
 
         return loss_core
+
