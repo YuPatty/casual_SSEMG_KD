@@ -296,7 +296,7 @@ Key options:
 bundle (build it via steps 2–3 first if you want to use it):
 
     python inference_student.py \
-        --config config/config_student_crossarch.yaml \
+        --config config/student_16ch_1blk.yaml \
         --weights <path/to/student_checkpoint.pth> \
         --dataset dataset/test_spectrogram.pt \
         --csv-out <path/to/results.csv> \
@@ -404,7 +404,7 @@ Student-grid mask, not the Teacher's native mask. Time-KD (0.25) is a separate e
 
 For 256/128 KD, use the separate `pipeline_distill_crossarch_v6_256_128.py`,
 `distill_loss_v3_256_128.py`, `cross_resolution_256_128.py`, and
-`config/student_16ch_1blk_causal_256_128.yaml` once those variant files are uploaded.
+`config/student_16ch_1blk_causal_256_128.yaml`.
 Inference can share `inference_student_patched_v6_256_64.py` with the matching
 256/128 YAML. Keep every grid/KD/seed's model, CSV and resume paths separate;
 never let dev and normal jobs write the same experiment concurrently.
