@@ -1,6 +1,6 @@
 # SSEMG-Net
 
-Official implementation of **SSEMG-Net: A Spectrogram-Based Mamba Network for Surface Electromyography Denoising**, together with a cross-architecture knowledge distillation (KD) pipeline that compresses SSEMG-Net into a lightweight, CPU-deployable student model.
+Research fork of [SSEMG-Net](https://github.com/HowardShih/SSEMG-Net): **A Spectrogram-Based Mamba Network for Surface Electromyography Denoising**, together with a cross-architecture knowledge distillation (KD) pipeline that compresses SSEMG-Net into a lightweight, CPU-deployable student model.
 
 SSEMG-Net (Teacher) removes ECG artifacts from surface electromyography signals using:
 
@@ -26,22 +26,10 @@ The Student model (`StudentSSEMGNet`) replaces the TF-Bi-Mamba backbone with dep
 > See `spectrogram_dataset.py`'s docstring and `verify_dataset_coverage.py`
 > for details and a sanity-check tool.
 >
-> **⚠️ Required folder layout: `MECG-E/`.** Every script that needs
-> `models/`, `distill_loss.py` / `distill_loss_v3.py`, `spectrogram_utils.py`,
-> or `spectrogram_dataset.py` resolves them via
-> `sys.path.insert(0, os.path.join(ROOT_DIR, 'MECG-E'))` — i.e. it expects
-> those files to live inside a `MECG-E/` subfolder at the repo root (a
-> `baseline_model/*.py` script resolves `ROOT_DIR` as *its parent's* parent,
-> so `MECG-E/` still means the repo root's `MECG-E/`, not
-> `baseline_model/MECG-E/`). This repo currently ships `models/`,
-> `distill_loss.py`, `spectrogram_utils.py`, `spectrogram_dataset.py`, and
-> `verify_dataset_coverage.py`'s dependency at the **repo root**, not inside
-> `MECG-E/` — before running anything, either move those files into a
-> `MECG-E/` folder yourself, or symlink one (`ln -s . MECG-E` from the repo
-> root also works, since `.` already contains everything `MECG-E/` needs to
-> contain). `pipeline_distill_crossarch_v5.py` additionally expects
-> `distill_loss_v3.py` specifically (not `distill_loss.py`) inside that same
-> `MECG-E/` folder.
+> **Folder layout:** current v6 entry points import models from `MECG-E/models/`.
+> Keep loss, dataset, and STFT helpers at the repository root. Do not move all
+> helpers into `MECG-E/`, replace its existing directory with a symlink, or mix
+> the legacy root-level `models/` with the causal model implementation.
 
 ## Main files
 
@@ -50,14 +38,18 @@ The Student model (`StudentSSEMGNet`) replaces the TF-Bi-Mamba backbone with dep
 - `verify_dataset_coverage.py`: **[new]** diagnostic tool — checks that each split's noisy/clean pairs and subject/exercise/channel coverage match `prepare_data.py`'s intended split
 - `convert.py`: *(optional, legacy)* waveform-to-spectrogram `.pt` conversion
 - `make_dataset_spectrogram.py`: *(optional, legacy)* noisy-clean spectrogram pairing and tensor dataset construction (produces `dataset/*_spectrogram.pt`)
-- `models/SSEMGNet.py`: SSEMG-Net (Teacher) model architecture
-- `models/StudentNet.py`: StudentSSEMGNet (Student) model architecture
+- `MECG-E/models/SSEMGNet.py`: SSEMG-Net (Teacher) model architecture used by current entry points
+- `MECG-E/models/StudentNet.py`: StudentSSEMGNet (Student), including the causal variant
 - `pipeline_spectrogram.py`: Teacher training pipeline
 - `pipeline_distill_crossarch.py`: cross-architecture knowledge distillation pipeline (trains the Student)
 - `pipeline_distill_crossarch_v5.py`: newer iteration of the above (same CLI/behavior otherwise)
+- `pipeline_distill_crossarch_v6_256_64.py`: causal 256/64 Student training (Response KD or `--no_kd`)
+- `distill_loss_v3_256_64.py` and `cross_resolution_256_64.py`: mask-fixed Student-grid KD targets and waveform/STFT helpers
+- `inference_student_patched_v6_256_64.py`: config-driven Student inference; requires the dataset version accepting STFT parameters
+- `config/student_16ch_1blk_causal_256_64.yaml`: causal 16ch/1blk Student, n_fft/hop/win=256/64/256
 - `distill_loss.py`: KD loss functions, annealing and curriculum schedulers
 - `check_loss_balance.py`: sanity-checks whether KD loss terms are balanced
-- `inference_demo.py`: Teacher inference, evaluation, and visualization
+- `inference_teacher_patched_v6.py`: Teacher inference from waveform directories; `inference_demo.py` is a legacy `.pt` entry point
 - `inference_student.py`: Student inference and evaluation *(legacy — still reads a `.pt` bundle via `--dataset`; kept unmodified, prefer `inference_student_patched.py` below)*
 - `inference_student_patched.py`: Student inference with optional per-SNR grouped evaluation (`--snr_labels`); use this instead of `inference_student.py` when reproducing the SNR-conditioned results reported in the paper
 - `spectrogram_utils.py`: STFT and inverse STFT utilities
@@ -238,15 +230,16 @@ The training objective contains:
 
 Run:
 
-    python inference_demo.py \
+    python inference_teacher_patched_v6.py \
         --config config/config_spectrogram_v19_tt_mask.yaml \
         --weights /path/to/checkpoint.pth \
         --dataset semg_data/processed \
         --batch 64 \
         --index 0
 
-`--dataset` points at the waveform directory (`semg_data/processed`), same
-as `--data_root` in step 4.
+`--dataset` in this patched entry point points at the waveform directory
+(`semg_data/processed`), same as `--data_root` in step 4. The legacy
+`inference_demo.py` expects a `.pt` file, not this directory.
 
 The evaluation reports:
 
@@ -279,7 +272,7 @@ The command below reproduces the reported edge-deployment result (16ch/1blk, Res
 `pipeline_distill_crossarch_v5.py` takes the same CLI and can be used as a
 drop-in replacement.
 
-Training stops via early stopping well before reaching `--epochs`; `--epochs` only sets the upper bound and the length of the α annealing schedule (see `--schedule_epochs` below to decouple the two).
+Training may stop via early stopping before reaching `--epochs`; `--epochs` only sets the upper bound and the length of the α annealing schedule (see `--schedule_epochs` below to decouple the two).
 
 Key options:
 
@@ -294,7 +287,7 @@ Key options:
 - `--two_stage` / `--two_stage_ratio`: hard-switch training into a Teacher-only representation stage followed by a Ground-Truth-only fine-tuning stage
 - `--seed`: fix random/numpy/torch seeds for closer run-to-run reproducibility
 - `--resume` / `--resume_path`: resume training from a full training-state checkpoint (model + optimizer + scheduler + epoch + best_val + no_improve + RNG state), kept separate from the `--model_save` inference checkpoint
-- `--use_amp` / `--num_workers` / `--no_cudnn_benchmark`: pure speed options that do not change training results
+- `--use_amp` / `--num_workers` / `--no_cudnn_benchmark`: speed/backend options; numerical results and exact reproducibility may differ
 - `--swa` / `--swa_dir`: collect per-epoch checkpoints after the schedule ends, for Stochastic Weight Averaging
         
 ## 7. Evaluate the Student
@@ -319,9 +312,9 @@ supports the per-SNR breakdown:
         --csv-out <path/to/results.csv> \
         --exp-alias "Student_KD"
  
-To reproduce the per-SNR breakdown reported in the paper, additionally pass `--snr_labels <path/to/test_snr_labels.json>` (built with `build_snr_labels.py`, **not yet committed to this repo** — regenerate it from the test split definition in step 3, or add the script here for full reproducibility). This writes an extra `*_by_snr.csv` file alongside the main results CSV.
+To report per-SNR scores, additionally pass `--snr_labels <path/to/test_snr_labels.json>`, verified against the exact dataset ordering. `build_snr_labels.py` is included but rebuilds labels from legacy `.pt` data; do not assume it produces waveform-order labels. The option writes an extra `*_by_snr.csv` alongside the main results CSV.
 
-`inference_demo.py` also works with a Student checkpoint and config for single-sample visualization, the same as step 5.
+Use the matching Student inference entry point and configuration; do not pass a waveform directory to the legacy `inference_demo.py`.
 
 ## Repository workflow
 
@@ -343,7 +336,7 @@ The default (no `.pt` cache) pipeline is:
         ↓
     StudentSSEMGNet (Student) checkpoint
         ↓
-    inference_demo.py / inference_student_patched.py
+    inference_student_patched.py / inference_student_patched_v6_256_64.py
         ↓
     Evaluation metrics and visualizations
 
@@ -374,14 +367,14 @@ subject/exercise/channel coverage matches `prepare_data.py`'s intended split
 ## Causal student (streaming-oriented variant)
 
 `config/student_16ch_1blk_causal.yaml` is the same student with `model.causal: True`.
-With the flag on, `models/StudentNet.py` switches to:
+With the flag on, `MECG-E/models/StudentNet.py` switches to:
 
 - time-axis convolutions (DenseBlock, TF-ConvBlock temporal DS-Conv) that pad **only the past** side;
 - per-frame normalisation (`CausalGroupNorm2d`, `ChannelGroupNorm1d`) instead of GroupNorm/InstanceNorm
   statistics that span the whole time axis;
 - no batch-wide input-format sniffing in `forward_spectrogram`.
 
-With the flag off (default) the network is exactly the original, and old checkpoints still load.
+With the flag off (default) the network uses the non-causal path; old checkpoint compatibility still depends on parameter names and strict loading.
 A causal student has different layers/statistics, so it **must be trained from scratch** (KD from the
 non-causal teacher works unchanged because the STFT frame grid is not modified):
 
@@ -392,10 +385,51 @@ Verify causality (future frames must not change past outputs):
     python test_causality.py --config config/student_16ch_1blk_causal.yaml   # expect ✔
     python test_causality.py --config config/student_16ch_1blk.yaml          # expect ✘ (original is non-causal)
 
-**Not yet causal end-to-end:** the STFT front end (`center=True` reflect padding looks ~win/2 ahead) and the
-iSTFT overlap-add (needs up to `win_size` samples of look-ahead; 512 ms at 1 kHz with `win_size=512`) still
-have look-ahead. Only the *network* is causal. A streaming front end (left-padded `center=False` STFT,
-shorter synthesis window / smaller `win_size`) is the next step and requires retraining the teacher on the same grid.
+**Not yet causal end-to-end:** the STFT front end still uses `center=True`, and streaming synthesis/state handling has not been validated. Only the *network* is causal; window/hop durations are not measured end-to-end latency. A different Student grid does not require retraining the Teacher on that grid when using the waveform re-analysis KD described below.
+
+### Cross-resolution experiments (256/64 and 256/128)
+
+The current best causal Student uses Teacher 512/128/512 and Student 256/64/256
+(n_fft/hop/win), with the same 16ch/1blk architecture. Use
+`pipeline_distill_crossarch_v6_256_64.py`,
+`config/student_16ch_1blk_causal_256_64.yaml`, and Teacher weights
+`model_weight/v19_tt_mask_v2_mix_nv0_weights.pth`.
+Keep the section 6 settings: batch=4, accum=4, epochs/schedule_epochs=150,
+patience=20, seed=42, linear annealing, feature/phase KD=0.
+
+Teacher enhanced waveforms are re-analysed on the Student grid before computing
+`L_KD = 3.5 L_mask + 5.0 L_mag + 2.3 L_complex`. The maskfix version applies the
+Student's actual `low_gate` to the target before full-mask MSE; this is an effective
+Student-grid mask, not the Teacher's native mask. Time-KD (0.25) is a separate experiment.
+
+For 256/128 KD, use the separate `pipeline_distill_crossarch_v6_256_128.py`,
+`distill_loss_v3_256_128.py`, `cross_resolution_256_128.py`, and
+`config/student_16ch_1blk_causal_256_128.yaml` once those variant files are uploaded.
+Inference can share `inference_student_patched_v6_256_64.py` with the matching
+256/128 YAML. Keep every grid/KD/seed's model, CSV and resume paths separate;
+never let dev and normal jobs write the same experiment concurrently.
+
+Recorded Test-set Average values (not multi-seed averages):
+
+| Model | Window / Hop | KD | SNRimp ↑ (dB) | RMSE ↓ | RMSE_ARV ↓ | MeanF ↓ (Hz) | MedianF ↓ (Hz) | RMSEM ↓ |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| Teacher v2 | 512 / 128 | — | 22.1147 | 0.0073 | 0.0009 | 5.6848 | 12.5988 | 0.0068 |
+| Causal Student | 512 / 128 | No KD | 19.3322 | 0.0103 | 0.0017 | 9.7434 | 20.4424 | 0.0093 |
+| Causal Student | 512 / 128 | Response KD | 20.3197 | 0.0092 | 0.0017 | 8.9362 | 18.7363 | 0.0083 |
+| Causal Student | 256 / 128 | No KD | 19.4559 | 0.0101 | 0.0018 | 9.6686 | 19.9868 | 0.0091 |
+| Causal Student | 256 / 128 | Response KD | 19.8847 | 0.0097 | 0.0018 | 9.6936 | 19.9983 | 0.0087 |
+| Causal Student | 256 / 64 | No KD | 20.5371 | 0.0090 | 0.0016 | 8.3531 | 17.5542 | 0.0081 |
+| Causal Student | 256 / 64 | Response KD | **20.7771** | **0.0088** | 0.0016 | 8.6045 | 18.1679 | **0.0079** |
+| Causal Student | 256 / 64 | Response KD + Time-KD (0.25) | 20.6001 | 0.0090 | 0.0016 | 8.5908 | 18.2037 | 0.0081 |
+
+256-series Students use seed 42; Teacher/older 512-series seeds are not yet
+confirmed. MeanF is the logged RMSE_MF/RMSE_MeanF (one metric, not two).
+Historical initialization/resume and concurrent-writer differences mean these
+are recorded experiments, not a strictly controlled single-factor ablation.
+Use the same metrics implementation and batch=64; printed RMSE is not the mean
+of the per-sample CSV RMSE. Inference uses the best-validation `.pth`, not
+`.resume_state.pth`; keep the best 256/64 KD checkpoint named
+`student_16ch_1blk_respKD_causal_256_64_teacher_v2_maskfix_dev.pth` separate from Time-KD.
 
 ## Installation
 
