@@ -39,7 +39,8 @@ WIN_SIZE = 512
 COMPRESS_FACTOR = 0.5
 
 
-def _wav_to_spec_2FT(wav: np.ndarray) -> torch.Tensor:
+def _wav_to_spec_2FT(wav: np.ndarray, n_fft=N_FFT, hop_size=HOP_SIZE,
+                     win_size=WIN_SIZE, compress_factor=COMPRESS_FACTOR) -> torch.Tensor:
     """
     單一波形 -> [2, F, T] float32 tensor
     channel 0 = 壓縮幅值 (magnitude ** compress_factor)
@@ -50,7 +51,7 @@ def _wav_to_spec_2FT(wav: np.ndarray) -> torch.Tensor:
     """
     x = torch.as_tensor(wav, dtype=torch.float32).unsqueeze(0)  # [1, T_samples]
     with torch.no_grad():
-        mag, pha, _ = mag_pha_stft(x, N_FFT, HOP_SIZE, WIN_SIZE, COMPRESS_FACTOR)
+        mag, pha, _ = mag_pha_stft(x, n_fft, hop_size, win_size, compress_factor)
         # mag, pha: [1, F, T] -> squeeze(0) -> [F, T]
         spec = torch.stack([mag.squeeze(0), pha.squeeze(0)], dim=0)  # [2, F, T]
     return spec.contiguous().float()
@@ -115,9 +116,15 @@ class OnTheFlySpectrogramDataset(Dataset):
     因為 CUDA context 不適合在 fork 出來的 worker process 裡使用）。
     """
 
-    def __init__(self, data_root, split, noisy_dirname="noisy", clean_dirname="clean"):
+    def __init__(self, data_root, split, noisy_dirname="noisy", clean_dirname="clean",
+                 n_fft=N_FFT, hop_size=HOP_SIZE, win_size=WIN_SIZE,
+                 compress_factor=COMPRESS_FACTOR):
         split_dir = os.path.join(data_root, split)
         self.pairs = collect_waveform_pairs(split_dir, noisy_dirname, clean_dirname, ext=".npy")
+        self.n_fft = int(n_fft)
+        self.hop_size = int(hop_size)
+        self.win_size = int(win_size)
+        self.compress_factor = float(compress_factor)
 
     def __len__(self):
         return len(self.pairs)
@@ -127,8 +134,10 @@ class OnTheFlySpectrogramDataset(Dataset):
         noisy_wav = np.load(noisy_path)
         clean_wav = np.load(clean_path)
 
-        noisy_spec = _wav_to_spec_2FT(noisy_wav)
-        clean_spec = _wav_to_spec_2FT(clean_wav)
+        noisy_spec = _wav_to_spec_2FT(noisy_wav, self.n_fft, self.hop_size,
+                                       self.win_size, self.compress_factor)
+        clean_spec = _wav_to_spec_2FT(clean_wav, self.n_fft, self.hop_size,
+                                       self.win_size, self.compress_factor)
 
         # 與 pipeline_spectrogram.py 原本的 (clean_b, noisy_b) 順序對齊
         return clean_spec, noisy_spec
