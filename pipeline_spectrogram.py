@@ -13,7 +13,7 @@ def _autocast_ctx(device):            # 依舊包一層，之後呼叫不用改
 ROOT_DIR = os.path.dirname(__file__)
 sys.path.insert(0, os.path.join(ROOT_DIR, 'MECG-E'))
 from models.SSEMGNet import SSEMGNet           # noqa: E402
-from spectrogram_dataset import OnTheFlySpectrogramDataset
+from spectrogram_dataset import OnTheFlySpectrogramDataset, N_FFT, HOP_SIZE, WIN_SIZE, COMPRESS_FACTOR
 
 # ═══════════════════════════════════════════════════
 # utils
@@ -180,7 +180,7 @@ def _trim_log(log_csv, last_ep):
         csv.writer(f).writerows(keep)
 
 # ═══════════════════════════════════════════════════
-def run_training(cfg, data_root, resume=None):
+def run_training(cfg, data_root, resume=None, num_workers=None, patience=20, lr_patience=2):
     # ── 讀取 batch/epochs/accum/amp ─────────────────
     BATCH = int(cfg.get('train', {}).get('batch_size', 8))
     EPOCHS = int(cfg.get('train', {}).get('epochs', 100))
@@ -215,7 +215,7 @@ def run_training(cfg, data_root, resume=None):
     # ─── 動態學習率（與 v19 相同） ─────────────────────────
     from torch.optim.lr_scheduler import ReduceLROnPlateau
     scheduler = ReduceLROnPlateau(
-        optim, mode='min', factor=0.5, patience=2, min_lr=1e-6
+        optim, mode='min', factor=0.5, patience=lr_patience, min_lr=1e-6
     )
 
 
@@ -228,10 +228,24 @@ def run_training(cfg, data_root, resume=None):
     # ── 資料集：即時從 .npy 波形算頻譜圖，不用 train/valid_spectrogram.pt ──
     # data_root 現在要指向 prepare_data.py 的輸出（例如 semg_data/processed），
     # 不是 make_dataset_spectrogram.py 的 --output_dir。
+    # 防呆：dataset 的 STFT 參數寫死在 spectrogram_dataset.py，必須跟 config 的 model 區塊一致，
+    # 否則模型內部的 iSTFT/loss 跟輸入頻譜圖的格子對不上，而且不會報錯（結果會默默變差）。
+    _m = cfg.get('model') or {}
+    _cfg_stft = (_m.get('n_fft'), _m.get('hop_size'), _m.get('win_size'), _m.get('compress_factor'))
+    if None not in _cfg_stft and (_cfg_stft[0], _cfg_stft[1], _cfg_stft[2], float(_cfg_stft[3])) != \
+            (N_FFT, HOP_SIZE, WIN_SIZE, COMPRESS_FACTOR):
+        raise ValueError(f"STFT 參數不一致：config(n_fft,hop,win,compress)={_cfg_stft} "
+                         f"但 spectrogram_dataset.py = {(N_FFT, HOP_SIZE, WIN_SIZE, COMPRESS_FACTOR)}")
+
     train_ds = OnTheFlySpectrogramDataset(data_root, 'train')
     valid_ds = OnTheFlySpectrogramDataset(data_root, 'valid')
 
-    num_workers = max(0, (os.cpu_count() or 0) // 2)
+    # os.cpu_count() 在 Slurm 上會回報「整台節點」的核心數（可能上百），而你只被分配到 -c 個；
+    # train 和 valid 各一組 persistent workers，數量會翻倍而把節點拖垮。改成看實際可用核心，並設上限 8。
+    if num_workers is None:
+        n_cpu = len(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else (os.cpu_count() or 1)
+        num_workers = max(0, min(8, n_cpu - 2))
+    print(f"[data] num_workers={num_workers} (train {len(train_ds)} / valid {len(valid_ds)} samples)")
     use_pin = (device.type == 'cuda')
 
     train_loader = DataLoader(
@@ -273,7 +287,7 @@ def run_training(cfg, data_root, resume=None):
     print(f"[log] writing logs to {log_csv}")
 
     no_improve_epochs  = 0        # ← 新增：連續沒進步的計數
-    PATIENCE           = 10        # ← 想要連續幾個 epoch 才停
+    PATIENCE           = patience  # early stopping：連續幾個 epoch 沒進步才停（--patience，預設 20）
     model_save, fallback_save = _get_model_savepath(cfg, data_root)
     print(f"[ckpt] will save to: {model_save}")
 
@@ -573,6 +587,13 @@ if __name__ == '__main__':
                    help='從上次中斷處繼續。不帶值＝自動找 model_weight/<exp>_ckpt.pth '
                         '(找不到就退回 _last.pth + train_log.csv)；也可指定 checkpoint 路徑。'
                         '記得 --config / --suffix 要跟上次一致。')
+    p.add_argument('--patience', type=int, default=20,
+                   help='early stopping：val_loss 連續幾個 epoch 沒進步就停止（預設 20，原本寫死 10）')
+    p.add_argument('--lr_patience', type=int, default=2,
+                   help='ReduceLROnPlateau 的 patience（連續幾個 epoch 沒進步就把 lr 減半，預設 2＝原本設定）；'
+                        '注意：--resume 時 scheduler 狀態會從 checkpoint 還原，這個參數不會覆蓋舊值')
+    p.add_argument('--num_workers', type=int, default=None,
+                   help='DataLoader workers；不給＝依實際可用核心自動決定（上限 8）')
     args = p.parse_args()
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
@@ -583,4 +604,5 @@ if __name__ == '__main__':
         cfg['exp']['name'] = f"{old}{args.suffix}"
         print(f"[exp] name -> {cfg['exp']['name']}")
 
-    run_training(cfg, args.data_root, resume=args.resume)
+    run_training(cfg, args.data_root, resume=args.resume, num_workers=args.num_workers,
+                 patience=args.patience, lr_patience=args.lr_patience)
